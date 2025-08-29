@@ -479,3 +479,453 @@ class AITaskManagementSystem:
         joblib.dump(self.priority_encoder, encoder_path)
         print("✅ Priority predictor model and encoder saved as 'priority_predictor_model.pkl' and 'priority_encoder.pkl'")
 
+    def forecast_task_volume(self, periods=30):
+        """Week 3: Time Series Forecasting of Task Creation"""
+        print("\n=== TIME SERIES FORECAST: FUTURE TASK VOLUME ===")
+        model_path = 'task_forecast_model.pkl'
+        if os.path.exists(model_path):
+            print(f"Loading existing forecast model from {model_path}...")
+            self.task_forecast_model = joblib.load(model_path)
+            print("✅ Forecast model loaded successfully!")
+            return
+
+        if self.df.empty or 'created_at' not in self.df.columns:
+            print("⚠ No valid data available for forecasting.")
+            return
+
+        self.df['created_at'] = pd.to_datetime(self.df['created_at'], errors='coerce')
+        self.df = self.df.dropna(subset=['created_at'])
+
+        date_min = self.df['created_at'].min().date()
+        date_max = self.df['created_at'].max().date()
+        all_dates = pd.date_range(start=date_min, end=date_max, freq='D')
+        daily_tasks = self.df.groupby(self.df['created_at'].dt.date).size().reset_index(name='task_count')
+        daily_tasks.columns = ['ds', 'y']
+        daily_tasks['ds'] = pd.to_datetime(daily_tasks['ds'])
+
+        all_dates_df = pd.DataFrame({'ds': all_dates})
+        daily_tasks = all_dates_df.merge(daily_tasks, on='ds', how='left').fillna({'y': 0})
+
+        if len(daily_tasks) < 2:
+            print("⚠ Not enough daily data for time series forecasting.")
+            return
+
+        train_size = int(0.8 * len(daily_tasks))
+        train_data = daily_tasks.iloc[:train_size]
+        test_data = daily_tasks.iloc[train_size:]
+
+        model = Prophet(
+            daily_seasonality=True,
+            weekly_seasonality=True,
+            changepoint_prior_scale=0.05,
+            seasonality_prior_scale=10.0
+        )
+        model.fit(train_data)
+
+        if len(test_data) > 0:
+            future_test = model.make_future_dataframe(periods=len(test_data), include_history=False)
+            forecast_test = model.predict(future_test)
+            forecast_test['yhat'] = forecast_test['yhat'].clip(lower=0)
+            mae = mean_absolute_error(test_data['y'], forecast_test['yhat'][:len(test_data)])
+            rmse = np.sqrt(mean_squared_error(test_data['y'], forecast_test['yhat'][:len(test_data)]))
+            print(f"Test Set MAE: {mae:.2f} tasks")
+            print(f"Test Set RMSE: {rmse:.2f} tasks")
+
+        future = model.make_future_dataframe(periods=periods)
+        forecast = model.predict(future)
+        forecast['yhat'] = forecast['yhat'].clip(lower=0)
+
+        print(f"\n📈 Forecasting task volume for the next {periods} days...")
+        print(f"Average Predicted Tasks per Day: {forecast['yhat'][-periods:].mean():.2f}")
+        fig = model.plot(forecast)
+        plt.title("Forecasted Task Creation Volume")
+        plt.xlabel("Date")
+        plt.ylabel("Number of Tasks")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+        model.plot_components(forecast)
+        plt.tight_layout()
+        plt.show()
+
+        self.task_forecast_model = model
+        self.task_forecast = forecast
+        joblib.dump(self.task_forecast_model, model_path)
+        print("✅ Forecast model saved as 'task_forecast_model.pkl'")
+
+    def implement_workload_balancer(self):
+        """Week 3: Workload Balancing Logic"""
+        print("\n=== WORKLOAD BALANCING ===")
+        if self.df.empty or 'user_id' not in self.df.columns:
+            print("⚠ No user data available for workload balancing.")
+            return
+
+        user_stats = self.df.groupby('user_id').agg({
+            'user_workload': 'first',
+            'user_behavior_score': 'first',
+            'task_id': 'count'
+        }).rename(columns={'task_id': 'task_count'})
+        user_stats.to_csv('users.csv')
+        print("✅ User data saved as 'users.csv'")
+        print("User Workload Statistics:")
+        print(user_stats.head())
+
+        def assign_task_to_user(task_priority, task_category, available_users):
+            compatible_users = available_users[
+                (available_users['user_workload'] < 15) &
+                (available_users['user_behavior_score'] > 0.5)
+            ]
+            if len(compatible_users) == 0:
+                return available_users.iloc[0]['user_id']
+            selected_user = compatible_users.loc[compatible_users['user_workload'].idxmin()]
+            return selected_user['user_id']
+
+        self.workload_balancer = assign_task_to_user
+        print("Workload balancer implemented successfully!")
+
+    def predict_task_duration(self):
+        """Week 3: Duration Prediction"""
+        print("\n=== DURATION PREDICTION ===")
+        model_path = 'duration_predictor_model.pkl'
+        scaler_path = 'duration_scaler.pkl'
+        if os.path.exists(model_path) and os.path.exists(scaler_path):
+            print(f"Loading existing duration predictor model from {model_path} and scaler from {scaler_path}...")
+            self.duration_predictor = joblib.load(model_path)
+            self.duration_scaler = joblib.load(scaler_path)
+            print("✅ Duration predictor model and scaler loaded successfully!")
+            return
+
+        duration_data = self.df[self.df['estimated_duration_min'].notna()].copy()
+        if len(duration_data) < 10:
+            print("⚠ Insufficient data for duration prediction training.")
+            self.duration_predictor = None
+            return
+
+        Q1 = duration_data['estimated_duration_min'].quantile(0.25)
+        Q3 = duration_data['estimated_duration_min'].quantile(0.75)
+        IQR = Q3 - Q1
+        duration_data = duration_data[
+            (duration_data['estimated_duration_min'] >= Q1 - 1.5 * IQR) &
+            (duration_data['estimated_duration_min'] <= Q3 + 1.5 * IQR)
+        ]
+
+        duration_features = [
+            'user_workload', 'user_behavior_score', 'task_description_length',
+            'task_category_encoded', 'priority_level_encoded'
+        ]
+        X_duration = duration_data[duration_features].copy()
+        y_duration = pd.to_numeric(duration_data['estimated_duration_min'])
+
+        X_duration.fillna({
+            'user_workload': X_duration['user_workload'].mean(),
+            'user_behavior_score': X_duration['user_behavior_score'].mean(),
+            'task_description_length': X_duration['task_description_length'].median(),
+            'task_category_encoded': X_duration['task_category_encoded'].mode()[0],
+            'priority_level_encoded': X_duration['priority_level_encoded'].mode()[0]
+        }, inplace=True)
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_duration, y_duration, test_size=0.2, random_state=42
+        )
+
+        X_train_scaled = self.duration_scaler.fit_transform(X_train)
+        X_test_scaled = self.duration_scaler.transform(X_test)
+
+        param_dist = {
+            'n_estimators': randint(50, 200),
+            'max_depth': [10, 20, None],
+            'min_samples_split': randint(2, 10),
+            'min_samples_leaf': randint(1, 5)
+        }
+        rf = RandomForestRegressor(random_state=42)
+        random_search = RandomizedSearchCV(
+            rf, param_distributions=param_dist, n_iter=10, cv=3,
+            scoring='neg_mean_absolute_error', random_state=42, n_jobs=-1
+        )
+        random_search.fit(X_train_scaled, y_train)
+
+        self.duration_predictor = random_search.best_estimator_
+        print(f"Best Parameters: {random_search.best_params_}")
+
+        y_pred = self.duration_predictor.predict(X_test_scaled)
+        mae = mean_absolute_error(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        r2 = r2_score(y_test, y_pred)
+        print(f"Test Set MAE: {mae:.2f} minutes")
+        print(f"Test Set RMSE: {rmse:.2f} minutes")
+        print(f"Test Set R²: {r2:.3f}")
+
+        joblib.dump(self.duration_predictor, model_path)
+        joblib.dump(self.duration_scaler, scaler_path)
+        print("✅ Duration predictor model and scaler saved as 'duration_predictor_model.pkl' and 'duration_scaler.pkl'")
+
+    def create_dashboard_summary(self):
+        """Week 4: Dashboard and Results"""
+        print("\n=== WEEK 4: FINAL DASHBOARD SUMMARY ===")
+        print("=== MODEL PERFORMANCE SUMMARY ===")
+        if self.task_classifier and self.X.shape[1] == self.task_classifier.n_features_in_:
+            y_true = self.df['task_category']
+            y_pred_categories = self.task_classifier.predict(self.X)
+            accuracy = accuracy_score(y_true, y_pred_categories)
+            print(f"Task Classification Accuracy: {accuracy:.3f}")
+        else:
+            print("⚠ Cannot compute task classification accuracy: Model or feature mismatch.")
+
+        if self.priority_predictor and self.X.shape[1] == self.priority_predictor.n_features_in_:
+            y_true_priority = self.priority_encoder.transform(self.df['priority_level'])
+            y_pred_priority = self.priority_predictor.predict(self.X)
+            priority_accuracy = accuracy_score(y_true_priority, y_pred_priority)
+            print(f"Priority Prediction Accuracy: {priority_accuracy:.3f}")
+        else:
+            print("⚠ Cannot compute priority prediction accuracy: Model or feature mismatch.")
+
+        if self.duration_predictor:
+            duration_data = self.df[self.df['estimated_duration_min'].notna()].copy()
+            duration_features = [
+                'user_workload', 'user_behavior_score', 'task_description_length',
+                'task_category_encoded', 'priority_level_encoded'
+            ]
+            X_duration = duration_data[duration_features].fillna({
+                'user_workload': duration_data['user_workload'].mean(),
+                'user_behavior_score': duration_data['user_behavior_score'].mean(),
+                'task_description_length': duration_data['task_description_length'].median(),
+                'task_category_encoded': duration_data['task_category_encoded'].mode()[0],
+                'priority_level_encoded': duration_data['priority_level_encoded'].mode()[0]
+            })
+            X_duration_scaled = self.duration_scaler.transform(X_duration)
+            y_duration = pd.to_numeric(duration_data['estimated_duration_min'])
+            y_pred_duration = self.duration_predictor.predict(X_duration_scaled)
+            mae = mean_absolute_error(y_duration, y_pred_duration)
+            print(f"Duration Prediction MAE: {mae:.2f} minutes")
+        else:
+            print("⚠ Cannot compute duration prediction MAE: Model not available.")
+
+        print("\n=== SYSTEM STATISTICS ===")
+        print(f"Total Tasks Processed: {len(self.df)}")
+        print(f"Unique Users: {self.df['user_id'].nunique()}")
+        print(f"Task Categories: {', '.join(self.df['task_category'].unique())}")
+        print(f"Priority Levels: {', '.join(self.df['priority_level'].unique())}")
+
+        print("\n=== USER PERFORMANCE ANALYSIS ===")
+        user_performance = self.df.groupby('user_role').agg({
+            'user_behavior_score': 'mean',
+            'user_workload': 'mean',
+            'task_id': 'count'
+        }).round(3)
+        print(user_performance)
+
+    def predict_new_task(self, task_description, user_workload=5, user_behavior_score=0.8,
+                        days_until_due=7, user_role='Developer'):
+        """Predict category, priority, duration, and assign user for a new task"""
+        print("\n=== NEW TASK PREDICTION ===")
+        required_artifacts = {
+            'vectorizer': 'tfidf_vectorizer.pkl',
+            'label_encoders': 'label_encoders.pkl',
+            'scaler': 'feature_scaler.pkl',
+            'task_classifier': 'task_classifier_model.pkl',
+            'priority_predictor': 'priority_predictor_model.pkl',
+            'priority_encoder': 'priority_encoder.pkl',
+            'duration_predictor': 'duration_predictor_model.pkl',
+            'duration_scaler': 'duration_scaler.pkl'
+        }
+        for attr, path in required_artifacts.items():
+            if not getattr(self, attr) and not os.path.exists(path):
+                print(f"❌ Error: Required artifact '{path}' not found. Cannot make predictions.")
+                return None, None, None, None
+            if not getattr(self, attr):
+                try:
+                    setattr(self, attr, joblib.load(path))
+                    print(f"Loaded {path}")
+                except Exception as e:
+                    print(f"❌ Error loading {path}: {e}")
+                    return None, None, None, None
+
+        try:
+            if not hasattr(self.vectorizer, 'idf_'):
+                print("❌ Error: TF-IDF vectorizer is not fitted. Cannot make predictions.")
+                return None, None, None, None
+        except AttributeError:
+            print("❌ Error: TF-IDF vectorizer is not initialized. Cannot make predictions.")
+            return None, None, None, None
+
+        processed_desc = self.preprocess_text(task_description)
+        try:
+            tfidf_features = self.vectorizer.transform([processed_desc])
+            current_features = tfidf_features.shape[1]
+            if current_features < self.expected_tfidf_features:
+                print(f"⚠ TF-IDF features ({current_features}) less than expected ({self.expected_tfidf_features}). Padding with zeros...")
+                padding = csr_matrix((1, self.expected_tfidf_features - current_features))
+                tfidf_features = hstack([tfidf_features, padding])
+            elif current_features > self.expected_tfidf_features:
+                print(f"⚠ TF-IDF features ({current_features}) more than expected ({self.expected_tfidf_features}). Truncating...")
+                tfidf_features = tfidf_features[:, :self.expected_tfidf_features]
+        except NotFittedError:
+            print("❌ Error: TF-IDF vectorizer is not fitted during prediction.")
+            return None, None, None, None
+
+        # Use default values for encoded features initially
+        user_role_encoded = self.label_encoders['user_role'].transform([user_role])[0] \
+            if user_role in self.label_encoders['user_role'].classes_ else 0
+        if user_role not in self.label_encoders['user_role'].classes_:
+            print(f"⚠ Warning: User role '{user_role}' not seen during training. Using default encoding.")
+
+        # Use mode of encoded features from training data
+        task_category_encoded = self.df['task_category_encoded'].mode()[0] if 'task_category_encoded' in self.df else 0
+        priority_level_encoded = self.df['priority_level_encoded'].mode()[0] if 'priority_level_encoded' in self.df else 0
+        completion_status_encoded = 0  # Default for new tasks
+
+        traditional_features = np.array([[
+            user_workload,
+            user_behavior_score,
+            days_until_due,
+            len(task_description),
+            user_role_encoded,
+            completion_status_encoded,
+            task_category_encoded,
+            priority_level_encoded
+        ]])
+
+        try:
+            traditional_features_scaled = self.scaler.transform(traditional_features)
+        except Exception as e:
+            print(f"❌ Error scaling traditional features: {e}. Cannot make predictions.")
+            return None, None, None, None
+
+        X_new = hstack([tfidf_features, traditional_features_scaled])
+
+        # Predict task category
+        task_category_pred = 'Unknown'
+        if self.task_classifier:
+            expected_features = getattr(self.task_classifier, 'n_features_in_', self.X.shape[1] if hasattr(self, 'X') else 1008)
+            if X_new.shape[1] == expected_features:
+                task_category_pred = self.task_classifier.predict(X_new)[0]
+            else:
+                print(f"⚠ Feature mismatch for task classifier. Expected {expected_features}, got {X_new.shape[1]}. Using default category.")
+
+        task_category_encoded = self.label_encoders['task_category'].transform([task_category_pred])[0] \
+            if task_category_pred in self.label_encoders['task_category'].classes_ else 0
+        if task_category_pred not in self.label_encoders['task_category'].classes_:
+            print(f"⚠ Warning: Task category '{task_category_pred}' not seen during training. Using default encoding.")
+
+        # Update traditional features with predicted task category
+        traditional_features[0, 6] = task_category_encoded
+        traditional_features_scaled = self.scaler.transform(traditional_features)
+        X_new = hstack([tfidf_features, traditional_features_scaled])
+
+        # Predict priority
+        priority_pred = 'Unknown'
+        priority_pred_encoded = 0
+        if self.priority_predictor:
+            expected_features = getattr(self.priority_predictor, 'n_features_in_', self.X.shape[1] if hasattr(self, 'X') else 1008)
+            if X_new.shape[1] == expected_features:
+                priority_pred_encoded = self.priority_predictor.predict(X_new)[0]
+                priority_pred = self.priority_encoder.inverse_transform([priority_pred_encoded])[0]
+            else:
+                print(f"⚠ Feature mismatch for priority predictor. Expected {expected_features}, got {X_new.shape[1]}. Using default priority.")
+
+        # Update traditional features with predicted priority
+        traditional_features[0, 7] = priority_pred_encoded
+        traditional_features_scaled = self.scaler.transform(traditional_features)
+        X_new = hstack([tfidf_features, traditional_features_scaled])
+
+        predicted_category = task_category_pred
+        predicted_priority = priority_pred
+
+        # Predict duration
+        estimated_duration = None
+        if self.duration_predictor:
+            duration_features = np.array([[
+                user_workload,
+                user_behavior_score,
+                len(task_description),
+                task_category_encoded,
+                priority_pred_encoded
+            ]])
+            try:
+                duration_features_scaled = self.duration_scaler.transform(duration_features)
+                estimated_duration = self.duration_predictor.predict(duration_features_scaled)[0]
+            except Exception as e:
+                print(f"⚠ Error predicting duration: {e}. Skipping duration prediction.")
+
+        print(f"Task Description: {task_description}")
+        print(f"Predicted Category: {predicted_category}")
+        print(f"Predicted Priority: {predicted_priority}")
+        if estimated_duration is not None:
+            print(f"Predicted Estimated Duration: {estimated_duration:.1f} minutes")
+
+        assigned_user = None
+        if self.workload_balancer:
+            try:
+                available_users = pd.read_csv('users.csv') if os.path.exists('users.csv') else \
+                    self.df[['user_id', 'user_workload', 'user_behavior_score']].drop_duplicates()
+                assigned_user = self.workload_balancer(predicted_priority, predicted_category, available_users)
+                print(f"🔄 Task Assigned To User ID: {assigned_user}")
+            except Exception as e:
+                print(f"⚠ Error loading user data: {e}. Cannot assign user.")
+        else:
+            print("⚠ Workload balancer not implemented. Cannot assign user.")
+
+        return predicted_category, predicted_priority, estimated_duration, assigned_user
+
+    def generate_task_forecast(self, periods=30):
+        """Generate task volume forecast for a specified period"""
+        if not self.task_forecast_model:
+            model_path = 'task_forecast_model.pkl'
+            if os.path.exists(model_path):
+                try:
+                    self.task_forecast_model = joblib.load(model_path)
+                    print(f"Loaded forecast model from {model_path}")
+                except Exception as e:
+                    print(f"❌ Error loading {model_path}: {e}")
+                    return None
+            else:
+                print("❌ Error: Forecast model not found.")
+                return None
+        future = self.task_forecast_model.make_future_dataframe(periods=periods)
+        forecast = self.task_forecast_model.predict(future)
+        forecast['yhat'] = forecast['yhat'].clip(lower=0)
+        return forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
+
+def run_complete_project(csv_file_path=None):
+    """Execute the complete 4-week project plan"""
+    system = AITaskManagementSystem()
+    print("🚀 STARTING AI-POWERED TASK MANAGEMENT SYSTEM PROJECT")
+    print("=" * 60)
+
+    if csv_file_path:
+        print(f"📁 Loading data from CSV file: {csv_file_path}")
+        df = system.load_and_prepare_data(csv_file_path=csv_file_path)
+    else:
+        print("📁 No CSV file provided. Using sample dataset for demonstration.")
+        df = system.load_and_prepare_data()
+
+    system.exploratory_data_analysis()
+    system.prepare_features()
+    system.train_task_classifier()
+    system.train_priority_predictor()
+    system.implement_workload_balancer()
+    system.predict_task_duration()
+    system.forecast_task_volume(periods=30)
+    system.create_dashboard_summary()
+
+    print("\n" + "="*50)
+    print("TESTING NEW TASK PREDICTION")
+    print("="*50)
+
+    test_tasks = [
+        "Fix critical bug in payment processing system",
+        "Create user manual for new features",
+        "Implement OAuth authentication",
+        "Respond to customer inquiry about billing",
+        "Write a linkedin post for challenges in task"
+    ]
+
+    for task in test_tasks:
+        system.predict_new_task(task)
+        print("-" * 40)
+
+    return system
+
+if __name__ == "__main__":
+    ai_system = run_complete_project('task_dataset_noisy.csv')
